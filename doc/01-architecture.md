@@ -48,15 +48,15 @@ flowchart TB
     Ctx(("Context 全局单例<br/>cu_seqlens / slot_mapping / block_tables"))
 
     %% ① 调度：决定本步算哪些请求、占多大显存
-    LLM -->|add_request 入队| Sched
+    LLM -->|"add_request() 入队"| Sched
     LLM -->|step: schedule| Sched
     Sched -->|can_allocate · allocate<br/>can_append · preempt| BM
     Sched -->|seqs, is_prefill| LLM
 
     %% ② 执行：把调度结果翻译成 GPU 上的张量运算
-    LLM -->|call'(&quot;run&quot;, seqs, is_prefill')| MR
+    LLM -->|"call(&quot;run&quot;, seqs, is_prefill')"| MR
     MR -.->|prepare_* 写入元数据| Ctx
-    Ctx -.->|get_context() 读取| Attn
+    Ctx -.->|"get_context() 读取"| Attn
     MR -->|input_ids / positions| Model
     Model -->|逐层前向| Attn
     Attn -->|store_kvcache / flash-attn 读写| KV
@@ -65,7 +65,7 @@ flowchart TB
 
     %% ③ 后处理：推进序列状态、回收并哈希缓存
     MR -->|token_ids| LLM
-    LLM -->|postprocess(seqs, token_ids, …)| Sched
+    LLM -->|"postprocess(seqs, token_ids, …)"| Sched
     Sched -->|hash_blocks · deallocate| BM
 ```
 
