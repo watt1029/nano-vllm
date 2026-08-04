@@ -8,56 +8,68 @@
 
 ## 2. 目录结构与模块职责
 
-| 文件 | 角色 | 关键职责 |
-|------|------|----------|
-| [llm.py](../nanovllm/llm.py) | 入口 | `LLM(LLMEngine)`，用户唯一接触的类 |
-| [config.py](../nanovllm/config.py) | 配置 | `Config` dataclass：batch 上限、KV 块大小、TP 规模、显存利用率 |
-| [sampling_params.py](../nanovllm/sampling_params.py) | 配置 | 每请求的温度、最大生成长度、是否忽略 EOS |
-| [engine/llm_engine.py](../nanovllm/engine/llm_engine.py) | **引擎** | 对外 `generate()`；对内 `step()` 主循环；TP 进程的创建者 |
-| [engine/scheduler.py](../nanovllm/engine/scheduler.py) | **调度** | 维护 `waiting`/`running` 队列；prefill 与 decode 两阶段调度；抢占 |
-| [engine/block_manager.py](../nanovllm/engine/block_manager.py) | **显存** | 固定大小 KV 块分配/释放；哈希前缀缓存 |
-| [engine/sequence.py](../nanovllm/engine/sequence.py) | 数据 | `Sequence`：请求的 token 容器 + 状态机；`SequenceStatus` |
-| [engine/model_runner.py](../nanovllm/engine/model_runner.py) | **执行** | 模型前向；KV Cache 划分配置；CUDA Graph 捕获；多卡 worker 进程 |
-| [models/qwen3.py](../nanovllm/models/qwen3.py) | 模型 | Qwen3 解码器 + 因果 LM 头 |
-| [layers/](../nanovllm/layers/) | 算子 | 注意力、并行线性层、RMSNorm、RoPE、嵌入/LM 头、采样器 |
-| [utils/context.py](../nanovllm/utils/context.py) | 元数据 | `Context` 全局对象：携带每步的 cu_seqlens/slot_mapping/block_table |
-| [utils/loader.py](../nanovllm/utils/loader.py) | 权重 | 读取 safetensors，按"打包映射 + TP 分片"写入参数 |
+| 文件　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 | 角色　　 | 关键职责　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 |
+| ----------------------------------------------------------------| ----------| --------------------------------------------------------------------|
+| [llm.py](../nanovllm/llm.py)　　　　　　　　　　　　　　　　　 | 入口　　 | `LLM(LLMEngine)`，用户唯一接触的类　　　　　　　　　　　　　　　　 |
+| [config.py](../nanovllm/config.py)　　　　　　　　　　　　　　 | 配置　　 | `Config` dataclass：batch 上限、KV 块大小、TP 规模、显存利用率　　 |
+| [sampling_params.py](../nanovllm/sampling_params.py)　　　　　 | 配置　　 | 每请求的温度、最大生成长度、是否忽略 EOS　　　　　　　　　　　　　 |
+| [engine/llm_engine.py](../nanovllm/engine/llm_engine.py)　　　 | **引擎** | 对外 `generate()`；对内 `step()` 主循环；TP 进程的创建者　　　　　 |
+| [engine/scheduler.py](../nanovllm/engine/scheduler.py)　　　　 | **调度** | 维护 `waiting`/`running` 队列；prefill 与 decode 两阶段调度；抢占　|
+| [engine/block_manager.py](../nanovllm/engine/block_manager.py) | **显存** | 固定大小 KV 块分配/释放；哈希前缀缓存　　　　　　　　　　　　　　　|
+| [engine/sequence.py](../nanovllm/engine/sequence.py)　　　　　 | 数据　　 | `Sequence`：请求的 token 容器 + 状态机；`SequenceStatus`　　　　　 |
+| [engine/model_runner.py](../nanovllm/engine/model_runner.py)　 | **执行** | 模型前向；KV Cache 划分配置；CUDA Graph 捕获；多卡 worker 进程　　 |
+| [models/qwen3.py](../nanovllm/models/qwen3.py)　　　　　　　　 | 模型　　 | Qwen3 解码器 + 因果 LM 头　　　　　　　　　　　　　　　　　　　　　|
+| [layers/](../nanovllm/layers/)　　　　　　　　　　　　　　　　 | 算子　　 | 注意力、并行线性层、RMSNorm、RoPE、嵌入/LM 头、采样器　　　　　　　|
+| [utils/context.py](../nanovllm/utils/context.py)　　　　　　　 | 元数据　 | `Context` 全局对象：携带每步的 cu_seqlens/slot_mapping/block_table |
+| [utils/loader.py](../nanovllm/utils/loader.py)　　　　　　　　 | 权重　　 | 读取 safetensors，按"打包映射 + TP 分片"写入参数　　　　　　　　　 |
 
 ## 3. 整体组件协作图
 
-一次 `generate()` 调用中，各模块的协作关系（图中的方框与 `engine/` 下文件一一对应）：
+一次 `generate()` 调用中，主进程每调用一次 `step()`，就完成「调度 → 执行 → 后处理」的闭环。引擎侧的方框（LLMEngine / Scheduler / BlockManager / ModelRunner）与 `engine/` 下的文件一一对应；GPU 侧是模型与算子：
 
 ```mermaid
 flowchart TB
     User([用户代码]) -->|prompts + SamplingParams| LLM
 
-    subgraph LLMEngine 主进程
-        LLM["LLM / LLMEngine<br/>generate() + step()"]
+    subgraph CPU["LLMEngine 主进程 —— 调度层"]
+        LLM["LLMEngine<br/>generate() → step() 主循环"]
         Sched["Scheduler<br/>waiting / running 队列"]
-        BM["BlockManager<br/>KV 块 + 前缀缓存表"]
-        LLM -->|add_request 入队| Sched
-        LLM -->|step: schedule| Sched
-        Sched -->|seqs, is_prefill| LLM
-        Sched -->|allocate / preempt / hash| BM
-        LLM -->|seqs + 采样参数| MR
-        MR -->|token_ids| LLM
-        LLM -->|postprocess 更新缓存| Sched
+        BM["BlockManager<br/>KV 块池 + 前缀哈希表"]
     end
 
-    subgraph GPU 侧 (每个 TP rank 一份)
-        MR["ModelRunner<br/>prepare → forward → sample"]
-        Model["Qwen3ForCausalLM<br/>embed → N×DecoderLayer → head"]
-        Attn["Attention<br/>flash-attn varlen / kvcache"]
+    subgraph GPU["GPU —— 执行层（每个 TP rank 一份）"]
+        MR["ModelRunner<br/>prepare → run_model → sample"]
+        Model["Qwen3ForCausalLM<br/>embed → N×DecoderLayer → lm_head"]
+        Attn["Attention<br/>store_kvcache + flash-attn"]
         KV[("Paged KV Cache<br/>[2, L, num_blocks, B, n_kv_h, d]")]
-        MR --> Model
-        Model --> Attn
-        Attn -->|store_kvcache / 读取| KV
+        Smp["Sampler（仅 rank 0）"]
     end
 
-    LLM -->|每步一次| MR
+    Ctx(("Context 全局单例<br/>cu_seqlens / slot_mapping / block_tables"))
+
+    %% ① 调度：决定本步算哪些请求、占多大显存
+    LLM -->|add_request 入队| Sched
+    LLM -->|step: schedule| Sched
+    Sched -->|can_allocate · allocate<br/>can_append · preempt| BM
+    Sched -->|seqs, is_prefill| LLM
+
+    %% ② 执行：把调度结果翻译成 GPU 上的张量运算
+    LLM -->|call'(&quot;run&quot;, seqs, is_prefill')| MR
+    MR -.->|prepare_* 写入元数据| Ctx
+    Ctx -.->|get_context() 读取| Attn
+    MR -->|input_ids / positions| Model
+    Model -->|逐层前向| Attn
+    Attn -->|store_kvcache / flash-attn 读写| KV
+    Model -->|logits| Smp
+    Smp -->|token_ids| MR
+
+    %% ③ 后处理：推进序列状态、回收并哈希缓存
+    MR -->|token_ids| LLM
+    LLM -->|postprocess(seqs, token_ids, …)| Sched
+    Sched -->|hash_blocks · deallocate| BM
 ```
 
-**数据流的关键点**：`Sequence` 对象（含 block_table）从 Scheduler 流出，经 `step()` 交给 ModelRunner；ModelRunner 把"哪些请求、哪些 token"翻译成 4 个 GPU 张量（`input_ids / positions / slot_mapping / block_table`，放在 `Context` 里），模型前向时注意力算子据此读写分页 KV Cache，最后 rank 0 采样出新 token，流回 Scheduler 更新状态。
+**数据流的关键点**：`Sequence`（含 block_table）从 Scheduler 流出，经 `step()` 交给 ModelRunner；ModelRunner 把「哪些请求、哪些 token」翻译成 GPU 张量（`input_ids / positions / slot_mapping / block_tables`）并写入全局单例 `Context`，模型前向时注意力算子 `get_context()` 据此读写分页 KV Cache，最后 rank 0 采样出新 token，流回 Scheduler 更新状态。三个阶段的编排完全由 `LLMEngine.step()` 完成。
 
 ## 4. 进程 / 多卡模型
 
